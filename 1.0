@@ -1,0 +1,1633 @@
+-- ragebot.lua — автономный ragebot, часть 1/7
+-- boot + config + deps + server detect + helpers
+print("[rage] boot 1/7")
+
+local Players = game:GetService("Players")
+local Replicated = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local Camera = workspace.CurrentCamera
+local LocalPlayer = Players.LocalPlayer
+local HttpService = game:GetService("HttpService")
+
+-- выгрузить возможные прошлые хуки
+for _, key in ipairs({"zaml_aim", "zaml_rage", "cf_aim", "rage"}) do
+    local s = getgenv()[key]
+    if type(s) == "table" and type(s.unload) == "function" then
+        pcall(s.unload)
+    end
+end
+getgenv().rage = nil
+
+-- ===== конфиг =====
+-- Логика: все настройки ragebot в одном месте. UI меняет их на лету.
+local cfg = {
+    enabled = true,                 -- автостарт
+    auto_fire = true,               -- стрелять автоматически
+    hitbox = "Head",                -- Head / Body / Multipoint / Full Body
+    target_mode = "Distance",       -- Distance / Crosshair / Lowest HP
+    max_dist = math.huge,           -- максимальная дистанция до цели
+    min_dmg = 20,                   -- минимальный урон
+    min_dmg_override = false,       -- переопределить min_dmg
+    min_dmg_override_value = 5,
+    force_body = false,             -- всегда стрелять в тело
+    prefer_body_lethal = true,      -- если тело убивает — выбрать тело
+    miss_adapt = false,             -- после N промахов переходить на тело
+    misses_to_body = 2,
+    scan_hz = 30,                   -- частота сканирования
+    sticky = false,                 -- держать прошлую цель
+    autowall = true,                -- пробивать стены
+    wallbang = false,               -- подменять Hits если стена
+    wall_limit = false,             -- ограничение пробоя
+    max_walls = 1,
+    pen_mod = false,                -- override penetration
+    pen_value = 10,
+    bullet_tp = false,              -- телепорт origin к target
+    bullet_tp_dist = 2,
+    predict_ms = 0,                 -- prediction по velocity
+    origin_on = false,              -- сдвиг origin
+    origin_x = 0, origin_y = 0, origin_z = 0,
+    backtrack = false,              -- ringbuffer позиций
+    backtrack_ms = 200,
+    forward_track = false,          -- предсказание вперёд по velocity
+    forward_ms = 100,
+    tap_kill = false,               -- несколько выстрелов на убийство
+    max_taps = 3,
+    double_tap = false,
+    multi = false,                  -- стрелять по нескольким целям
+    team_check = false,             -- проверка команды (false = все враги)
+    ignore_friends = false,
+}
+getgenv().rage = cfg
+
+-- ===== require модулей игры =====
+-- Логика: путь через FindFirstChild + pcall(require). Если модуль переехал — вернёт nil,
+-- все фичи, которые от него зависят, отключатся.
+local function req(...)
+    local node = Replicated
+    for _, seg in ipairs({...}) do
+        node = node and node:FindFirstChild(seg)
+        if not node then return nil end
+    end
+    local ok, m = pcall(require, node)
+    return ok and m or nil
+end
+
+local Remotes = req("Database", "Security", "Remotes")
+if not (Remotes and Remotes.Inventory and Remotes.Inventory.ShootWeapon
+        and type(Remotes.Inventory.ShootWeapon.Send) == "function") then
+    cfg.enabled = false
+    print("[rage] CRITICAL: ShootWeapon.Send missing")
+    return
+end
+
+local GetRayIgnore = req("Components", "Common", "GetRayIgnore")
+local CharacterController = req("Controllers", "CharacterController")
+local HordeController = req("Controllers", "HordeController")
+local Participants = req("Components", "Common", "Participants")
+local SharedRaycast = req("Shared", "Raycast")
+
+print("[rage] deps: Remotes=true CC=" .. tostring(CharacterController ~= nil)
+    .. " Participants=" .. tostring(Participants ~= nil))
+
+-- ===== identity wrapper =====
+-- Логика: некоторые вызовы игры требуют identity 2 (game-уровень).
+-- Если executor сбросил identity — восстанавливаем после вызова.
+local getTID = getthreadidentity or (syn and syn.get_thread_identity)
+local setTID = setthreadidentity or (syn and syn.set_thread_identity)
+
+local function withIdentity(fn, ...)
+    local tid = getTID and getTID()
+    local ok, a, b = pcall(fn, ...)
+    if tid and setTID then pcall(setTID, tid) end
+    return ok, a, b
+end
+
+-- ===== server detect =====
+-- Логика: если в игре есть Shared.Raycast.castThroughDistance — сервер сам считает Hits,
+-- значит пакет должен идти БЕЗ Hits, только Origin+Direction.
+-- Если функции нет — клиент считает, Hits пишем сами.
+local server = { hits = false, router = nil }
+pcall(function() server.router = req("Database", "Security", "Router") end)
+
+function server.viewTick()
+    if not server.router then return nil end
+    local ok, v = pcall(server.router.broadcastRouter, "GetRemoteViewTick")
+    return ok and type(v) == "number" and v or nil
+end
+
+function server.setHits(v) server.hits = v end
+
+pcall(function()
+    if type(SharedRaycast) == "table"
+        and type(rawget(SharedRaycast, "castThroughDistance")) == "function" then
+        server.setHits(true)
+    end
+end)
+
+-- fallback: если первая проверка не сработала, но broadcastRouter работает — сервер тоже верифицирует
+task.spawn(function()
+    for _ = 1, 40 do
+        if not getgenv().rage or server.hits then return end
+        if server.viewTick() then
+            server.setHits(true)
+            return
+        end
+        task.wait(3)
+    end
+end)
+
+print("[rage] server_hits=" .. tostring(server.hits))
+
+-- ===== helpers =====
+-- Логика: U() — текущий CFrame камеры. LT() — origin пули (камера или смещённый origin).
+local function U() return Camera.CFrame end
+
+local function LT()
+    local cf = U()
+    if not cfg.origin_on then return cf.Position end
+    local _, yaw = cf:ToEulerAnglesYXZ()
+    return cf.Position + (CFrame.Angles(0, yaw, 0)):VectorToWorldSpace(
+        Vector3.new(cfg.origin_x, cfg.origin_y, cfg.origin_z))
+end
+
+-- Логика: getSlot — какое оружие в руках сейчас. Через debug.getupvalue достаём
+-- внутреннюю таблицу CharacterController.getInventorySlot, где лежит CurrentEquipped.
+local function getSlot()
+    if not CharacterController or type(CharacterController.getInventorySlot) ~= "function" then
+        return nil
+    end
+    local ok, up = pcall(debug.getupvalue, CharacterController.getInventorySlot, 1)
+    if ok and type(up) == "table" then
+        return rawget(up, "CurrentEquipped")
+    end
+    return nil
+end
+
+-- Логика: uT — penetration оружия. При server_hits — реальный, иначе можно override.
+local function uT(props)
+    if server.hits then return props and props.Penetration or 0 end
+    if cfg.wall_limit then return math.huge end
+    if cfg.pen_mod then return cfg.pen_value end
+    return props and props.Penetration or 0
+end
+
+local function minDmg()
+    return cfg.min_dmg_override and cfg.min_dmg_override_value or cfg.min_dmg
+end
+-- часть 2/7 — entities + team/enemy
+
+-- Логика: entities собирает всех участников катки: обычных Player + ботов через Participants.GetAll
+-- + зомби через HordeController.GetLiveShells. Каждый обёрнут в единый интерфейс с .Character/.Name/.GetAttribute.
+-- Кэш 0.2 секунды — чтобы не перебирать всех каждый тик.
+
+-- обёртка для ботов (не Player) — даёт .Character/.Name/.GetAttribute как у Player
+local botCache = setmetatable({}, { __mode = "k" })
+
+local function wrapBot(inst)
+    if not Participants then return nil end
+    local cached = botCache[inst]
+    if cached then return cached end
+
+    local w = setmetatable({ IsBot = true, UserId = 0 }, {
+        __index = function(_, key)
+            if key == "Character" then
+                local ok, v = withIdentity(Participants.Character, inst)
+                return ok and v or nil
+            elseif key == "Name" or key == "DisplayName" then
+                local ok, v = withIdentity(Participants.Name, inst)
+                return (ok and type(v) == "string") and v or inst.Name
+            elseif key == "Parent" then
+                return inst.Parent
+            end
+            return nil
+        end,
+    })
+
+    function w.GetAttribute(_, key)
+        local v = inst:GetAttribute(key)
+        if v == nil then
+            local ok, ch = withIdentity(Participants.Character, inst)
+            if ok and ch then v = ch:GetAttribute(key) end
+        end
+        return v
+    end
+
+    botCache[inst] = w
+    return w
+end
+
+-- обёртка для зомби — .Character это Model
+local zombieCache = setmetatable({}, { __mode = "k" })
+
+local function wrapZombie(model)
+    local r = zombieCache[model]
+    if r then return r end
+    r = {
+        IsZombie = true, IsBot = true, UserId = 0,
+        Name = "zombie", DisplayName = "zombie",
+        Character = model, Parent = model.Parent,
+    }
+    function r.GetAttribute(_, key) return model:GetAttribute(key) end
+    zombieCache[model] = r
+    return r
+end
+
+-- активные зомби-модели
+local function liveShells()
+    local out = {}
+    if HordeController and type(HordeController.GetLiveShells) == "function" then
+        local ok, list = withIdentity(HordeController.GetLiveShells)
+        if ok and type(list) == "table" then
+            for _, s in pairs(list) do
+                if typeof(s) == "Instance" and s.Parent and s:FindFirstChild("Head") then
+                    out[#out + 1] = s
+                end
+            end
+            return out
+        end
+    end
+    local hh = workspace:FindFirstChild("HordeShells")
+    for _, s in ipairs(hh and hh:GetChildren() or {}) do
+        if s:IsA("Model") and s:GetAttribute("HordeId") ~= nil
+            and not s:GetAttribute("Ragdolled") and s:FindFirstChild("Head") then
+            out[#out + 1] = s
+        end
+    end
+    return out
+end
+
+-- кэшированный список сущностей
+local entCache, entAt = nil, 0
+
+local function entities()
+    local now = os.clock()
+    if entCache and now - entAt < 0.2 then return entCache end
+    entAt = now
+
+    local out = {}
+    for _, p in ipairs(Players:GetPlayers()) do out[#out + 1] = p end
+
+    if Participants then
+        local ok, list = withIdentity(Participants.GetAll)
+        if ok and type(list) == "table" then
+            for _, e in pairs(list) do
+                if typeof(e) == "Instance" and not e:IsA("Player") then
+                    local w = wrapBot(e)
+                    if w then out[#out + 1] = w end
+                end
+            end
+        end
+    end
+
+    for _, s in ipairs(liveShells()) do out[#out + 1] = wrapZombie(s) end
+
+    entCache = out
+    return out
+end
+
+-- кэш "друзей" — чтобы не дёргать IsFriendsWith каждый тик
+local friendCache = setmetatable({}, { __mode = "k" })
+
+local function checkFriend(plr)
+    if plr == LocalPlayer or friendCache[plr] ~= nil then return end
+    friendCache[plr] = false
+    task.spawn(function()
+        local ok, v = pcall(LocalPlayer.IsFriendsWith, LocalPlayer, plr.UserId)
+        friendCache[plr] = ok and v == true
+    end)
+end
+for _, p in ipairs(Players:GetPlayers()) do checkFriend(p) end
+pcall(function() Players.PlayerAdded:Connect(checkFriend) end)
+
+-- ===== team/enemy =====
+-- Логика: кто враг. Учитывает зомби (все враги), Horde mode (все кроме зомби), Deathmatch (все враги),
+-- Team attribute (Terrorists vs Counter-Terrorists). Боты без команды — враги.
+
+local function isEnemy(a)
+    if a == LocalPlayer then return false end
+
+    -- зомби всегда враг
+    if type(a) == "table" and a.IsZombie then return true end
+
+    -- Horde mode — все кроме зомби НЕ враги
+    if workspace:FindFirstChild("HordeShells") then return false end
+
+    if not cfg.team_check then return true end
+
+    -- боты без команды — враги
+    if type(a) == "table" and a.IsBot then
+        local t = a:GetAttribute("Team")
+        local mt = LocalPlayer:GetAttribute("Team")
+        if t == nil or mt == nil then return true end
+        return t ~= mt
+    end
+
+    if cfg.ignore_friends and friendCache[a] then return false end
+
+    -- Deathmatch — все враги
+    if workspace:GetAttribute("Gamemode") == "Deathmatch" then return true end
+
+    local t = a:GetAttribute("Team")
+    return (t == "Terrorists" or t == "Counter-Terrorists")
+        and t ~= LocalPlayer:GetAttribute("Team")
+end
+
+-- ===== alive check =====
+-- Логика: возвращает Character если он живой, есть нужная часть, не в workspace — nil.
+local function character(a, part)
+    local c = a.Character
+    if not c then return nil end
+    if c:GetAttribute("Dead") or c:GetAttribute("Ragdolled") then return nil end
+    local hp = c:GetAttribute("Health")
+    if type(hp) == "number" and hp <= 0 then return nil end
+    if not c:IsDescendantOf(workspace) then return nil end
+    if not c:FindFirstChild(part or "Head") then return nil end
+    return c
+end
+
+-- Логика: invincible-проверка — не стрелять в бессмертных.
+local function isInvincible(c)
+    if not c then return false end
+    return c:GetAttribute("Invincible") == true
+end
+
+-- Логика: полный фильтр для ragebot — враг, не invincible.
+local function enemyFilter(a)
+    if not isEnemy(a) then return false end
+    if cfg.ignore_friends and friendCache[a] then return false end
+    return true
+end
+
+-- Логика: какой Player/бот владеет этим Character (обратный поиск).
+local function ownerOf(char)
+    if not char then return nil end
+    for _, e in ipairs(entities()) do
+        if e.Character == char then return e end
+    end
+    return nil
+end
+
+print("[rage] part 2 ready")
+-- часть 3/7 — raycast walk + penetration + bullet teleport
+
+-- Логика: UT — raycast walk. Идёт от origin по direction, собирает все hits,
+-- для каждого непробитого объекта делает обратный raycast чтобы узнать толщину.
+-- Возвращает hits[], достигнут ли target, сколько стен пробито, overWall flag.
+
+local MATERIAL_HARDNESS = {
+    [Enum.Material.Plastic] = 10,
+    [Enum.Material.SmoothPlastic] = 10,
+    [Enum.Material.Wood] = 10,
+    [Enum.Material.WoodPlanks] = 10,
+    [Enum.Material.Cardboard] = 10,
+    [Enum.Material.Glass] = 25,
+    [Enum.Material.Fabric] = 25,
+}
+local VARIANT_HARDNESS = { ["Sandy Brick"] = 0, IndoorWall = 0 }
+
+local function hardness(mv) 
+    if mv ~= 0 then return mv end
+    if workspace:GetAttribute("Map") == "Reactor" then return -1 end
+    return mv
+end
+
+local function effectiveMaterial(inst)
+    local p = inst.Parent
+    if p and p:HasTag("BreakableDoor") then return Enum.Material.Metal end
+    return inst.Material
+end
+
+-- Логика: не считать "хитом" части собственного персонажа и аксессуары.
+local function isCharacterPart(inst)
+    return inst:FindFirstAncestorWhichIsA("Accessory") ~= nil
+        or inst:HasTag("CharacterAccessory")
+        or inst.Name == "CollisionCapsule"
+        or inst.Name == "HumanoidRootPart"
+end
+
+-- параметры для raycast
+local bulletRay = RaycastParams.new()
+bulletRay.FilterType = Enum.RaycastFilterType.Exclude
+bulletRay.CollisionGroup = "Bullet"
+
+local exitRay = RaycastParams.new()
+exitRay.FilterType = Enum.RaycastFilterType.Include
+exitRay.CollisionGroup = "Bullet"
+
+-- Логика: кэш ray-ignore (свой персонаж + все из GetRayIgnore). 0.1с — чтобы не строить каждый тик.
+local riCache = { at = 0, list = nil, char = nil }
+local function rayIgnore()
+    local now = os.clock()
+    local ch = LocalPlayer.Character
+    if riCache.list and riCache.char == ch and now - riCache.at < 0.1 then
+        return riCache.list
+    end
+    riCache.at, riCache.char = now, ch
+    local list = {}
+    if GetRayIgnore then
+        local ok, r = withIdentity(GetRayIgnore)
+        if ok and type(r) == "table" then
+            for _, v in ipairs(r) do list[#list + 1] = v end
+        end
+    end
+    if LocalPlayer.Character then list[#list + 1] = LocalPlayer.Character end
+    list[#list + 1] = Camera
+    riCache.list = list
+    return list
+end
+
+-- Логика: конвертирует raycast hit в формат, который сервер ожидает в Hits.
+local function makeHit(h, isExit)
+    return {
+        Instance = h.Instance,
+        Position = h.Position,
+        Normal = isExit and -h.Normal or h.Normal,
+        Material = h.Instance.Material.Name,
+        Exit = isExit == true,
+    }
+end
+
+-- Логика: сам walk. 64 итерации максимум — защита от бесконечного цикла.
+local function raycastWalk(origin, dir, maxDist, pen, targetChar)
+    bulletRay.FilterDescendantsInstances = rayIgnore()
+    local hits, accum, walls, cursor = {}, {}, 0, origin
+
+    for _ = 1, 64 do
+        local remaining = maxDist - (cursor - origin).Magnitude
+        if remaining <= 0 then break end
+
+        local hit = workspace:Raycast(cursor, dir * remaining, bulletRay)
+        if not hit then break end
+        bulletRay:AddToFilter(hit.Instance)
+
+        if not isCharacterPart(hit.Instance) then
+            hits[#hits + 1] = makeHit(hit, false)
+
+            if targetChar and hit.Instance:IsDescendantOf(targetChar) then
+                return hits, true, walls
+            end
+
+            -- penetration бесконечный — просто идём дальше
+            if pen == math.huge then
+                walls = walls + 1
+                cursor = hit.Position + dir * 0.01
+            else
+                -- обратный raycast чтобы узнать толщину стены
+                exitRay.FilterDescendantsInstances = { hit.Instance }
+                local far = hit.Position + dir * 1000
+                local back = workspace:Raycast(far, hit.Position - far, exitRay)
+                if not back then
+                    return hits, false, walls, true
+                end
+
+                local thickness = (hit.Position - back.Position).Magnitude
+                local variant = hit.Instance.MaterialVariant
+                local key, limit
+
+                if variant ~= "" and VARIANT_HARDNESS[variant] ~= nil then
+                    key = variant
+                    limit = hardness(VARIANT_HARDNESS[key]) + pen
+                else
+                    key = effectiveMaterial(hit.Instance)
+                    limit = hardness(MATERIAL_HARDNESS[key] or 0) + pen
+                end
+
+                accum[key] = (accum[key] or 0) + thickness
+                if accum[key] > limit then
+                    return hits, false, walls, true
+                end
+
+                hits[#hits + 1] = makeHit(back, true)
+                walls = walls + 1
+                cursor = back.Position + dir * 0.001
+            end
+        end
+    end
+
+    return hits, false, walls
+end
+
+-- Логика: DT — walk с wallbang. Если пуля не пробила стену но wallbang включён
+-- и это не server-verify — добавляем искусственный хит в target.
+local function DT(origin, dir, maxDist, pen, targetPart, wallbang)
+    local parent = targetPart and targetPart.Parent
+    local hits, hitTarget = raycastWalk(origin, dir, maxDist, pen, parent)
+    if wallbang and (not server.hits and (targetPart and not hitTarget)) then
+        hits[#hits + 1] = {
+            Instance = targetPart,
+            Position = targetPart.Position,
+            Normal = -dir,
+            Material = targetPart.Material.Name,
+            Exit = false,
+        }
+    end
+    return hits
+end
+
+-- Логика: mT — raycast до конкретной точки. Возвращает (дошло ли, wall-счётчик, hits).
+local function mT(origin, target, maxDist, pen)
+    local delta = target - origin
+    local dist = delta.Magnitude
+    if dist < 0.05 or dist > maxDist then return false, 0 end
+    local hits, hitTarget, _, overWall = raycastWalk(origin, delta.Unit, dist, pen, nil)
+    if overWall then return false, hitTarget end
+    return true, hitTarget, hits
+end
+
+-- Логика: jT — walk до target, потом добавить target-хит в конец.
+-- Используется ragebot'ом — строит массив Hits для пакета.
+local function jT(origin, target, targetPart, maxDist, pen, wallbang)
+    local hit, _, hits = mT(origin, target, maxDist, pen)
+    if not hit then
+        if not wallbang or server.hits then return nil end
+        hits = {}
+    end
+    local dir = (target - origin).Unit
+    hits[#hits + 1] = {
+        Instance = targetPart,
+        Position = target,
+        Normal = -dir,
+        Material = targetPart.Material.Name,
+        Exit = false,
+    }
+    return hits
+end
+
+-- Логика: kT — заполнить поле Distance для каждого хита (нужно серверу для валидации).
+local function kT(origin, hits)
+    local cursor = origin
+    for _, h in ipairs(hits) do
+        h.Distance = (h.Position - cursor).Magnitude
+        cursor = h.Position
+    end
+    return hits
+end
+
+-- ===== bullet teleport =====
+-- Логика: ищет точку за target'ом, откуда пуля попадёт в него (обратный raycast от 8 направлений).
+-- Нужно когда мы стреляем из-за угла — origin пули ставится за спиной target'а.
+
+local euRay = RaycastParams.new()
+euRay.FilterType = Enum.RaycastFilterType.Exclude
+euRay.CollisionGroup = "Bullet"
+local euLast = setmetatable({}, { __mode = "k" })
+local euStamp = nil
+
+local function bulletTP(part)
+    if not cfg.bullet_tp or not part or not part.Parent then return nil end
+
+    local pp = part.Position
+    local delta = U().Position - pp
+    local flat = Vector3.new(delta.X, 0, delta.Z)
+    flat = flat.Magnitude > 0.01 and flat.Unit or Vector3.new(0, 0, 1)
+
+    local side, up, dist = flat:Cross(Vector3.new(0, 1, 0)), Vector3.new(0, 1, 0), cfg.bullet_tp_dist
+    local dirs = {
+        flat, (flat + up).Unit, up, side, -side,
+        (flat + side).Unit, (flat - side).Unit, -flat,
+    }
+
+    if not euStamp or os.clock() - euStamp > 0.1 then
+        euRay.FilterDescendantsInstances = rayIgnore()
+        euStamp = os.clock()
+    end
+
+    local parent = part.Parent
+    local last = euLast[part] or 1
+    for k = 0, #dirs - 1 do
+        local idx = ((last - 1) + k) % #dirs + 1
+        local d = dirs[idx]
+        local origin = pp + d * dist
+        local hit = workspace:Raycast(origin, d * -(dist + 2), euRay)
+        if hit and hit.Instance:IsDescendantOf(parent) then
+            euLast[part] = idx
+            return origin
+        end
+    end
+    return nil
+end
+
+print("[rage] part 3 ready")
+-- часть 4/7 — damage calc + armor + calibration
+
+-- Логика: damage для конкретной части тела. Учитывает:
+-- - DamagePerPart базовый урон по зоне (Head/Torso/Arms/Legs)
+-- - RangeModifier ^ (dist / 0.075 / 500) — затухание по расстоянию
+-- - WallbangMultiplier ^ walls — потеря при пробитии стены
+-- - ArmorPenetration — если у target'а есть броня
+-- - BulletsPerShot — множитель для дробовиков
+
+local ZONE_MAP = {
+    Head = "Head",
+    UpperTorso = "Torso", LowerTorso = "Torso", HumanoidRootPart = "Torso", Torso = "Torso",
+    LeftUpperArm = "Arms", LeftLowerArm = "Arms", LeftHand = "Arms",
+    RightUpperArm = "Arms", RightLowerArm = "Arms", RightHand = "Arms",
+    LeftUpperLeg = "Legs", LeftLowerLeg = "Legs", LeftFoot = "Legs",
+    RightUpperLeg = "Legs", RightLowerLeg = "Legs", RightFoot = "Legs",
+}
+
+local HITBOX = {
+    Head = { "Head" },
+    Body = { "UpperTorso", "LowerTorso", "HumanoidRootPart" },
+    Multipoint = { "Head", "UpperTorso", "LowerTorso", "HumanoidRootPart" },
+    ["Full Body"] = {
+        "Head", "UpperTorso", "LowerTorso",
+        "LeftUpperArm", "LeftLowerArm", "LeftHand",
+        "RightUpperArm", "RightLowerArm", "RightHand",
+        "LeftUpperLeg", "LeftLowerLeg", "LeftFoot",
+        "RightUpperLeg", "RightLowerLeg", "RightFoot",
+    },
+}
+
+-- константа масштаба dist (в оригинале была bj = 0.075)
+local DIST_SCALE = 0.075
+
+-- Логика: парсим броню target'а из JSON-attribute.
+-- Возвращает (значение брони, есть ли шлем).
+local function parseArmor(owner)
+    local raw = owner:GetAttribute("Armor")
+    if type(raw) ~= "string" then return 0, false end
+    local ok, m = pcall(HttpService.JSONDecode, HttpService, raw)
+    if not ok or type(m) ~= "table" then return 0, false end
+    local hp = tonumber(m.Health) or 0
+    local helmet = type(m.Type) == "string" and m.Type:find("Helmet") ~= nil
+    return hp, helmet
+end
+
+-- Логика: базовый расчёт урона без калибровки.
+local function calcDamage(gun, partName, dist, walls, owner)
+    local zone = ZONE_MAP[partName]
+    local table_ = gun.DamagePerPart
+    if not zone or type(table_) ~= "table" or not table_[zone] then return 0 end
+
+    local dmg = table_[zone]
+    dmg = dmg * (gun.RangeModifier or 1) ^ ((dist / DIST_SCALE) / 500)
+    if walls > 0 then
+        dmg = dmg * (gun.WallbangMultiplier or 0.5) ^ walls
+    end
+
+    local armorHp, helmet = parseArmor(owner)
+    -- урон снижается бронёй везде кроме ног; для head'а — только если есть шлем
+    if armorHp > 0 and (zone ~= "Legs" and (zone ~= "Head" or helmet)) then
+        dmg = dmg * (gun.ArmorPenetration or 1)
+    end
+
+    return dmg * (gun.BulletsPerShot or 1)
+end
+
+-- ===== aZ calibration =====
+-- Логика: клиент думает что нанёс X, а реально сервер снял Y. Отношение Y/X — это
+-- поправочный коэффициент. Он адаптируется со временем: после каждого подтверждённого
+-- попадания (hit/kill) обновляем factor для пары (weapon, zone, wall-or-open).
+-- Хранится в файле чтобы не терять между сессиями.
+
+local calib = { factor = {}, samples = {}, pending = {} }
+
+do
+    local path = "zaml/bloxstrike/damage_calibration.json"
+
+    pcall(function()
+        if type(isfile) == "function" and isfile(path) then
+            local raw = readfile(path)
+            local ok, data = pcall(HttpService.JSONDecode, HttpService, raw)
+            if ok and type(data) == "table" then
+                calib.factor = data.factor or {}
+                calib.samples = data.samples or {}
+            end
+        end
+    end)
+
+    local dirty, dirtyAt = false, 0
+    local function save()
+        pcall(function()
+            if type(isfolder) == "function" and type(makefolder) == "function"
+                and not isfolder("zaml/bloxstrike") then
+                if not isfolder("zaml") then makefolder("zaml") end
+                makefolder("zaml/bloxstrike")
+            end
+            if type(writefile) == "function" then
+                writefile(path, HttpService:JSONEncode({
+                    factor = calib.factor, samples = calib.samples,
+                }))
+            end
+        end)
+        dirty = false
+    end
+
+    function calib.key(gunName, zone, walls)
+        return tostring(gunName) .. "|" .. tostring(zone)
+            .. "|" .. ((walls or 0) > 0 and "wall" or "open")
+    end
+
+    -- получить текущий коэффициент (default 1, clamp 0.6..1.4)
+    function calib.get(key)
+        return math.clamp(calib.factor[key] or 1, 0.6, 1.4)
+    end
+
+    -- запомнить ожидаемый урон — чтобы потом сравнить с реальным
+    function calib.expect(plr, key, raw)
+        calib.pending[plr] = { key = key, raw = raw, at = os.clock() }
+    end
+
+    -- обновить factor после подтверждённого попадания
+    -- actual — сколько HP реально снялось, hpBefore — было ли HP до выстрела
+    function calib.observe(plr, actual, hpBefore)
+        local m = calib.pending[plr]
+        calib.pending[plr] = nil
+        if not m or os.clock() - m.at > 1.5 or not m.raw or m.raw <= 0 then return end
+        if hpBefore and m.raw >= hpBefore then return end
+
+        local observed = math.clamp(actual / m.raw, 0.05, 2)
+        local n = (calib.samples[m.key] or 0) + 1
+        local old = calib.factor[m.key] or observed
+        -- первые 3 сэмпла — с большим весом, потом alpha 0.3 (стабилизация)
+        local alpha = n <= 3 and (1 / n) or 0.3
+
+        calib.factor[m.key] = old + (observed - old) * alpha
+        calib.samples[m.key] = n
+        dirty = true
+
+        if os.clock() - dirtyAt > 10 then
+            dirtyAt = os.clock()
+            task.delay(10, function() if dirty then save() end end)
+        end
+    end
+
+    function calib.reset()
+        calib.factor, calib.samples, calib.pending = {}, {}, {}
+        save()
+    end
+end
+
+-- Логика: R — применить калибровку к урону. При server.hits калибровка не работает —
+-- сервер сам считает, наши числа не имеют значения.
+local function applyCalib(gunName, partName, walls, raw)
+    local key = calib.key(gunName, ZONE_MAP[partName], walls)
+    if server.hits then
+        return raw, key
+    end
+    return raw * calib.get(key), key
+end
+
+print("[rage] part 4 ready")
+-- часть 5/7 — сканирование: q() — главная функция ragebot
+
+-- Логика: trackVelocity — каждый Heartbeat запоминает velocity каждого игрока.
+-- Усредняется Lerp(0.35) чтобы сгладить. Используется prediction'ом (predict_ms).
+local velTrack, velLast = setmetatable({}, { __mode = "k" }), setmetatable({}, { __mode = "k" })
+
+local function trackVelocity(dt)
+    if dt <= 0 then return end
+    for _, plr in ipairs(entities()) do
+        local ch = plr.Character
+        local root = ch and ch:FindFirstChild("HumanoidRootPart")
+        if root then
+            local pos = root.Position
+            local prev = velLast[plr]
+            if prev then
+                local v = (pos - prev) / dt
+                if v.Magnitude > 80 then v = Vector3.zero end
+                velTrack[plr] = (velTrack[plr] or v):Lerp(v, 0.35)
+            end
+            velLast[plr] = pos
+        else
+            velLast[plr], velTrack[plr] = nil, nil
+        end
+    end
+end
+
+-- Логика: predict — сдвиг target position по velocity * predict_ms.
+-- Y-компонент делится на 2 — компенсация гравитации.
+local function predict(part)
+    local ms = cfg.predict_ms or 0
+    if ms <= 0 or not part.Parent then return part.Position end
+    local own = nil
+    for _, e in ipairs(entities()) do
+        if e.Character == part.Parent then own = e; break end
+    end
+    local v = own and velTrack[own]
+    if not v then return part.Position end
+    return part.Position + Vector3.new(v.X, v.Y * 0.5, v.Z) * (ms / 1000)
+end
+
+-- Логика: trackBacktrack — ringbuffer 600мс. Запоминает позиции всех частей тела
+-- каждые 0.2с. Используется когда промахиваемся — перебираем прошлые позиции.
+local ALL_PARTS = {
+    "Head", "UpperTorso", "LowerTorso",
+    "LeftUpperArm", "LeftLowerArm", "LeftHand",
+    "RightUpperArm", "RightLowerArm", "RightHand",
+    "LeftUpperLeg", "LeftLowerLeg", "LeftFoot",
+    "RightUpperLeg", "RightLowerLeg", "RightFoot",
+}
+
+local backtrackBuf = setmetatable({}, { __mode = "k" })
+local BACKTRACK_WINDOW = 0.6
+
+local function trackBacktrack()
+    if not cfg.backtrack then
+        for k in pairs(backtrackBuf) do backtrackBuf[k] = nil end
+        return
+    end
+    for _, plr in ipairs(entities()) do
+        local ch = plr.Character
+        local root = ch and ch:FindFirstChild("HumanoidRootPart")
+        if root then
+            local buf = backtrackBuf[plr]
+            if not buf then buf = {}; backtrackBuf[plr] = buf end
+            local frame = { t = os.clock(), pos = {} }
+            for _, pn in ipairs(ALL_PARTS) do
+                local pt = ch:FindFirstChild(pn)
+                if pt then frame.pos[pn] = pt.Position end
+            end
+            frame.pos.HumanoidRootPart = root.Position
+            buf[#buf + 1] = frame
+            while buf[1] and frame.t - buf[1].t > BACKTRACK_WINDOW do
+                table.remove(buf, 1)
+            end
+        elseif backtrackBuf[plr] then
+            backtrackBuf[plr] = nil
+        end
+    end
+end
+
+-- Логика: autowall — проверка что пуля долетит до части тела. Возвращает
+-- (ok, walls). Если стены и !autowall и !wallbang — false. Если wallbang — true с walls.
+local function autowall(origin, part, char, pen, range)
+    local dir = (part.Position - origin).Unit
+    local _, hitTarget, walls = raycastWalk(origin, dir, range, pen, char.Parent)
+    if hitTarget then
+        if walls > 0 and (not cfg.autowall and (server.hits or (not cfg.wallbang and not cfg.wall_limit))) then
+            return false, 0
+        end
+        return true, walls
+    end
+    if cfg.wallbang and not server.hits then
+        local _, _, w2 = raycastWalk(origin, dir, range, math.huge, char.Parent)
+        return true, w2
+    end
+    return false, 0
+end
+
+-- ===== scan cache =====
+local scanCache, scanAt = {}, 0
+local currentTarget = nil
+local missesCount = setmetatable({}, { __mode = "k" })
+
+-- Логика: q() — главная функция. 1) собирает всех врагов в радиусе max_dist,
+-- 2) сортирует по target_mode, 3) для каждого перебирает hitbox-части,
+-- проверяет autowall, считает урон с калибровкой, 4) возвращает список валидных
+-- целей с (player, char, part, dmg, walls, hp).
+local function scan(gun)
+    local now = os.clock()
+
+    -- кэш — не чаще scan_hz
+    if now - scanAt < 1 / math.max(cfg.scan_hz, 1) then
+        for i = #scanCache, 1, -1 do
+            local s = scanCache[i]
+            if not s.part.Parent or s.char:GetAttribute("Dead") or isInvincible(s.char) then
+                table.remove(scanCache, i)
+            end
+        end
+        return scanCache
+    end
+    scanAt = now
+
+    local origin = LT()
+    local range = gun.Properties.Range or 500
+    local pen = uT(gun.Properties)
+    local vp = Camera.ViewportSize / 2
+    local threshold = minDmg()
+
+    -- 1. сбор кандидатов
+    local candidates = {}
+    for _, plr in ipairs(entities()) do
+        if enemyFilter(plr) then
+            local ch = character(plr, "HumanoidRootPart")
+            if ch and not isInvincible(ch) then
+                local dist = (ch.HumanoidRootPart.Position - origin).Magnitude
+                if dist < cfg.max_dist then
+                    local hp = tonumber(ch:GetAttribute("Health")) or 100
+                    local score = dist
+
+                    if cfg.target_mode == "Crosshair" then
+                        local v, on = Camera:WorldToViewportPoint(ch.HumanoidRootPart.Position)
+                        score = on and (Vector2.new(v.X, v.Y) - vp).Magnitude or math.huge
+                    elseif cfg.target_mode == "Lowest HP" then
+                        score = hp + dist / 10000
+                    end
+
+                    if cfg.sticky and plr == currentTarget then score = -math.huge end
+
+                    candidates[#candidates + 1] = {
+                        player = plr, char = ch, dist = dist, hp = hp, score = score,
+                    }
+                end
+            end
+        end
+    end
+    table.sort(candidates, function(a, b) return a.score < b.score end)
+
+    -- 2. для каждого кандидата — расчёт урона
+    local results = {}
+    local hitboxList = HITBOX[cfg.hitbox] or HITBOX.Head
+    if cfg.force_body then hitboxList = HITBOX.Body end
+
+    for _, cand in ipairs(candidates) do
+        local useHitbox = hitboxList
+        if cfg.miss_adapt and (missesCount[cand.player] or 0) >= cfg.misses_to_body then
+            useHitbox = HITBOX.Body
+        end
+
+        local hp = cand.hp
+        local best, bestBody = { dmg = 0 }, { dmg = 0 }
+
+        -- 3. перебор частей тела
+        for _, partName in ipairs(useHitbox) do
+            local part = cand.char:FindFirstChild(partName)
+            if part then
+                local ok, walls = autowall(origin, part, cand.char, pen, range)
+                if ok and (not cfg.wall_limit or walls <= cfg.max_walls) then
+                    local raw = calcDamage(gun, partName, (part.Position - origin).Magnitude,
+                        (cfg.wall_limit and not server.hits) and 0 or walls, cand.player)
+                    local dmg = applyCalib(gun.Name, partName, walls, raw)
+
+                    if dmg > best.dmg then
+                        best = { part = part, dmg = dmg, walls = walls }
+                    end
+                    if ZONE_MAP[partName] == "Torso" and dmg > bestBody.dmg then
+                        bestBody = { part = part, dmg = dmg, walls = walls }
+                    end
+                    if bestBody.dmg >= hp or (best.dmg >= hp and not cfg.prefer_body_lethal) then
+                        break
+                    end
+                end
+            end
+        end
+
+        if cfg.prefer_body_lethal and bestBody.part and bestBody.dmg >= hp then
+            best = bestBody
+        end
+
+        -- 4. backtrack fallback — если промахнулись, перебираем прошлые позиции
+        if (not best.part or (best.dmg < threshold and best.dmg < hp)) and cfg.backtrack then
+            local buf = backtrackBuf[cand.player]
+            if buf then
+                for i = #buf - 1, 1, -2 do
+                    local frame = buf[i]
+                    local age = (os.clock() - frame.t) * 1000
+                    if age > cfg.backtrack_ms then break end
+
+                    for _, partName in ipairs(useHitbox) do
+                        local part = cand.char:FindFirstChild(partName)
+                        local pastPos = frame.pos[partName]
+                        if part and pastPos then
+                            local dist = (pastPos - origin).Magnitude
+                            if dist < range then
+                                local ok, walls = autowall(origin,
+                                    { Position = pastPos, Parent = cand.char, Material = part.Material },
+                                    cand.char, pen, range)
+                                if ok then
+                                    local raw = calcDamage(gun, partName, dist,
+                                        (cfg.wall_limit and not server.hits) and 0 or walls, cand.player)
+                                    local dmg = applyCalib(gun.Name, partName, walls, raw)
+                                    if dmg > best.dmg then
+                                        best = { part = part, dmg = dmg, walls = walls, pos = pastPos }
+                                    end
+                                end
+                            end
+                        end
+                    end
+                    if best.pos and best.dmg >= hp then break end
+                end
+            end
+        end
+
+        -- 5. forward track — предсказание позиции по velocity
+        if (not best.part or (best.dmg < threshold and best.dmg < hp)) and cfg.forward_track then
+            local v = velTrack[cand.player]
+            if v and v.Magnitude > 1 then
+                for _, mult in ipairs({ 0.5, 1 }) do
+                    local ms = cfg.forward_ms * mult
+                    for _, partName in ipairs(useHitbox) do
+                        local part = cand.char:FindFirstChild(partName)
+                        if part then
+                            local futurePos = part.Position + v * (ms / 1000)
+                            local dist = (futurePos - origin).Magnitude
+                            if dist < range then
+                                local dir = (futurePos - origin).Unit
+                                local ok = workspace:Raycast(origin, dir * dist, rayIgnore()) == nil
+                                if ok then
+                                    local raw = calcDamage(gun, partName, dist, 0, cand.player)
+                                    local dmg = applyCalib(gun.Name, partName, 0, raw)
+                                    if dmg > best.dmg then
+                                        best = { part = part, dmg = dmg, walls = 0, pos = futurePos }
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+
+        if best.part and (best.dmg >= threshold or best.dmg >= hp) then
+            best.player, best.char, best.hp = cand.player, cand.char, hp
+            results[#results + 1] = best
+            if not cfg.multi then break end
+        end
+    end
+
+    currentTarget = results[1] and results[1].player or nil
+    scanCache = results
+    return results
+end
+
+print("[rage] part 5 ready")
+-- часть 6/7 — fire + Send-хук + Heartbeat loop
+
+-- Логика: fireRate — интервал между выстрелами из gun.Properties.FireRate,
+-- fallback 0.1 если нет.
+local function fireRate(gun)
+    local fr = type(gun.Properties) == "table" and gun.Properties.FireRate or nil
+    if type(fr) == "number" and fr > 0 then return fr end
+    return 0.1
+end
+
+-- Логика: fire — сборка пакета ShotWeapon.Send.
+-- 1) origin = bulletTP(target) или LT() (позиция камеры)
+-- 2) targetPos = target.pos (backtrack/forwardtrack) или predict(part)
+-- 3) direction = unit(targetPos - origin)
+-- 4) если server.hits — только Origin+Direction (сервер сам считает)
+--    иначе — Hits = jT(...) (мы говорим серверу куда попали)
+-- 5) пакет отправляется через Send
+
+local lastFire = 0
+
+local function fire(gun, target)
+    local props = gun.Properties
+    if not (props and gun.Identifier and target and target.part) then return false end
+
+    local origin = bulletTP(target.part) or LT()
+    local targetPos = target.pos or predict(target.part)
+    local dir = targetPos - origin
+    if dir.Magnitude < 0.05 then return false end
+    dir = dir.Unit
+
+    local range = props.Range or 500
+    local pen = uT(props)
+    local bullets = {}
+
+    for i = 1, math.max(props.BulletsPerShot or 1, 1) do
+        if server.hits then
+            -- сервер считает сам — отправляем только направление
+            bullets[i] = { Direction = dir, Origin = origin }
+        else
+            -- клиент считает — отправляем Hits с точкой попадания
+            local hits = jT(origin, targetPos, target.part, range, pen, cfg.wallbang)
+            if not hits then return false end
+            bullets[i] = {
+                Direction = dir,
+                Origin = origin,
+                Hits = kT(origin, hits),
+            }
+        end
+    end
+
+    -- последовательность пакета растёт — сервер проверяет что не реплей
+    gun.ShotSeq = (gun.ShotSeq or 0) + 1
+
+    local packet = {
+        IsSniperScoped = gun.IsSniperScoped,
+        ShootingHand = gun.ShootingHand,
+        Identifier = gun.Identifier,
+        Seq = gun.ShotSeq,
+        Bullets = bullets,
+        ViewTick = server.hits and server.viewTick() or nil,
+        __cf_rage = true,     -- маркер: этот пакет — от ragebot, не перезаписывать
+    }
+
+    local ok = pcall(Remotes.Inventory.ShootWeapon.Send, packet)
+    if ok then
+        -- локальные счётчики (клиент должен думать что выстрел прошёл)
+        gun.Rounds = math.max((gun.Rounds or 1) - 1, 0)
+        gun.RechargeStartTime = workspace:GetServerTimeNow()
+
+        -- для калибровки — запоминаем ожидаемый урон, если есть key
+        if target.player and target.dmg and target.dmg > 0 then
+            local key = calib.key(gun.Name, ZONE_MAP[target.part.Name], target.walls or 0)
+            calib.expect(target.player, key, target.dmg)
+        end
+    end
+
+    return ok
+end
+
+-- ===== Send hook =====
+-- Логика: перехватывает ВСЕ пакеты ShootWeapon.Send чтобы:
+-- 1) если это наш ragebot-пакет (__cf_rage) — пропустить как есть
+-- 2) иначе (обычный выстрел игрока) — обновить server.hits по наличию Hits,
+--    чтобы понимать что сервер сейчас ожидает
+local originalSend = Remotes.Inventory.ShootWeapon.Send
+
+local function sendHook(packet, ...)
+    if getgenv().rage ~= cfg then return originalSend(packet, ...) end
+
+    if type(packet) == "table" and type(packet.Bullets) == "table" then
+        if packet.__cf_rage then
+            -- наш пакет — пропускаем, маркер снимаем
+            packet.__cf_rage = nil
+            return originalSend(packet, ...)
+        end
+
+        -- обычный пакет — детектим server_hits
+        local b1 = packet.Bullets[1]
+        if type(b1) == "table" then
+            local isServer = (b1.Hits == nil)
+            if isServer ~= server.hits then
+                server.setHits(isServer)
+            end
+        end
+    end
+
+    return originalSend(packet, ...)
+end
+
+local hooked
+hooked = hookfunction(originalSend, sendHook)
+print("[rage] Send hooked: " .. type(hooked))
+
+-- ===== Heartbeat loop =====
+-- Логика: каждый Heartbeat:
+-- 1) обновляет velocity track и backtrack
+-- 2) достаёт текущее оружие, если нет — выход
+-- 3) сканирует цели
+-- 4) если есть target и auto_fire и прошёл fireRate — fire
+
+local heartbeat = RunService.Heartbeat:Connect(function(dt)
+    if not getgenv().rage or not cfg.enabled then return end
+
+    trackVelocity(dt)
+    trackBacktrack()
+
+    local gun = getSlot()
+    if not gun or not gun.Bullet or not gun.Properties or gun.IsReloading then return end
+    if (gun.Rounds or 0) <= 0 then return end
+
+    local results = scan(gun)
+    if #results == 0 or not cfg.auto_fire then return end
+
+    local now = os.clock()
+    if now - lastFire < fireRate(gun) then return end
+
+    -- tap-kill: несколько выстрелов чтобы убить (hp / dmg, макс max_taps)
+    local target = results[1]
+    local taps = 1
+    if cfg.tap_kill and target.dmg > 0 then
+        taps = math.clamp(math.ceil(target.hp / target.dmg), 1, cfg.max_taps)
+    end
+    if cfg.double_tap and taps < 2 then taps = 2 end
+
+    for _ = 1, taps do
+        if (gun.Rounds or 0) <= 0 then break end
+        if not fire(gun, target) then break end
+    end
+
+    lastFire = now
+end)
+
+-- ===== unload =====
+getgenv().rage.stats = function()
+    return {
+        targets = #scanCache,
+        server = server.hits,
+        gun = getSlot() ~= nil,
+    }
+end
+
+getgenv().rage.unload = function()
+    if heartbeat then pcall(function() heartbeat:Disconnect() end) end
+    if restorefunction and type(hooked) == "function" then
+        pcall(restorefunction, hooked)
+    end
+    getgenv().rage = nil
+    print("[rage] unloaded")
+end
+
+print("[rage] part 6 ready")
+-- часть 7/7 — GUI + автозапуск
+
+-- Логика: свой маленький GUI. Не WindUI — независимый. Окно с тогглами
+-- на все ключевые параметры ragebot. Управление через getgenv().rage.
+
+local function ensureGui()
+    if getgenv().rage_gui and getgenv().rage_gui.Parent then
+        return getgenv().rage_gui
+    end
+
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "rage_gui"
+    gui.IgnoreGuiInset = true
+    gui.ResetOnSpawn = false
+    gui.DisplayOrder = 2000000000
+
+    local parent
+    if gethui then
+        local ok, h = pcall(gethui)
+        if ok and typeof(h) == "Instance" then parent = h end
+    end
+    if not parent then
+        local ok, cg = pcall(function() return game:GetService("CoreGui") end)
+        if ok then parent = cg end
+    end
+    if not parent then parent = LocalPlayer:FindFirstChildOfClass("PlayerGui") end
+    if not parent then
+        print("[rage] GUI: no parent")
+        return nil
+    end
+    gui.Parent = parent
+    getgenv().rage_gui = gui
+
+    -- ===== main frame =====
+    local frame = Instance.new("Frame")
+    frame.Size = UDim2.fromOffset(320, 480)
+    frame.Position = UDim2.fromOffset(50, 50)
+    frame.BackgroundColor3 = Color3.fromRGB(20, 20, 25)
+    frame.BorderSizePixel = 0
+    frame.Active = true
+    frame.Parent = gui
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 8)
+    corner.Parent = frame
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = Color3.fromRGB(60, 60, 70)
+    stroke.Thickness = 1
+    stroke.Parent = frame
+
+    -- ===== title bar =====
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1, -40, 0, 30)
+    title.Position = UDim2.fromOffset(10, 0)
+    title.BackgroundTransparency = 1
+    title.Font = Enum.Font.GothamBold
+    title.TextSize = 14
+    title.TextColor3 = Color3.fromRGB(240, 240, 245)
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.Text = "ragebot"
+    title.Parent = frame
+
+    -- драг окна
+    local dragging, dragStart, startPos
+    title.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startPos = frame.Position
+        end
+    end)
+    title.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+            or input.UserInputType == Enum.UserInputType.Touch) then
+            local delta = input.Position - dragStart
+            frame.Position = UDim2.fromOffset(
+                startPos.X.Offset + delta.X,
+                startPos.Y.Offset + delta.Y)
+        end
+    end)
+    title.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
+    end)
+
+    -- ===== scroll =====
+    local scroll = Instance.new("ScrollingFrame")
+    scroll.Size = UDim2.new(1, -10, 1, -40)
+    scroll.Position = UDim2.fromOffset(5, 35)
+    scroll.BackgroundTransparency = 1
+    scroll.BorderSizePixel = 0
+    scroll.ScrollBarThickness = 3
+    scroll.ScrollBarImageColor3 = Color3.fromRGB(120, 120, 140)
+    scroll.CanvasSize = UDim2.fromOffset(0, 0)
+    scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    scroll.Parent = frame
+
+    local list = Instance.new("UIListLayout")
+    list.SortOrder = Enum.SortOrder.LayoutOrder
+    list.Padding = UDim.new(0, 4)
+    list.Parent = scroll
+
+    -- ===== хелперы для элементов =====
+    local order = 0
+
+    local function makeToggle(label, key, initial)
+        order = order + 1
+        local btn = Instance.new("TextButton")
+        btn.Size = UDim2.new(1, 0, 0, 28)
+        btn.BackgroundColor3 = Color3.fromRGB(35, 35, 45)
+        btn.BorderSizePixel = 0
+        btn.LayoutOrder = order
+        btn.Text = ""
+        btn.AutoButtonColor = false
+        btn.Parent = scroll
+
+        local c = Instance.new("UICorner")
+        c.CornerRadius = UDim.new(0, 6)
+        c.Parent = btn
+
+        local lbl = Instance.new("TextLabel")
+        lbl.Size = UDim2.new(1, -50, 1, 0)
+        lbl.Position = UDim2.fromOffset(10, 0)
+        lbl.BackgroundTransparency = 1
+        lbl.Font = Enum.Font.GothamMedium
+        lbl.TextSize = 12
+        lbl.TextColor3 = Color3.fromRGB(220, 220, 230)
+        lbl.TextXAlignment = Enum.TextXAlignment.Left
+        lbl.Text = label
+        lbl.Parent = btn
+
+        local pill = Instance.new("Frame")
+        pill.Size = UDim2.fromOffset(32, 16)
+        pill.Position = UDim2.new(1, -40, 0.5, -8)
+        pill.BackgroundColor3 = Color3.fromRGB(60, 60, 70)
+        pill.BorderSizePixel = 0
+        pill.Parent = btn
+
+        local pc = Instance.new("UICorner")
+        pc.CornerRadius = UDim.new(1, 0)
+        pc.Parent = pill
+
+        local knob = Instance.new("Frame")
+        knob.Size = UDim2.fromOffset(12, 12)
+        knob.Position = UDim2.fromOffset(2, 2)
+        knob.BackgroundColor3 = Color3.fromRGB(180, 180, 190)
+        knob.BorderSizePixel = 0
+        knob.Parent = pill
+
+        local kc = Instance.new("UICorner")
+        kc.CornerRadius = UDim.new(1, 0)
+        kc.Parent = knob
+
+        local function paint(on)
+            pill.BackgroundColor3 = on and Color3.fromRGB(100, 160, 255) or Color3.fromRGB(60, 60, 70)
+            knob.Position = on and UDim2.fromOffset(18, 2) or UDim2.fromOffset(2, 2)
+            knob.BackgroundColor3 = on and Color3.fromRGB(240, 240, 250) or Color3.fromRGB(180, 180, 190)
+        end
+
+        local state = initial == true
+        paint(state)
+
+        btn.MouseButton1Click:Connect(function()
+            state = not state
+            cfg[key] = state
+            paint(state)
+        end)
+
+        return {
+            set = function(v) state = v == true; cfg[key] = state; paint(state) end,
+        }
+    end
+
+    local function makeDropdown(label, key, options, initial)
+        order = order + 1
+        local btn = Instance.new("TextButton")
+        btn.Size = UDim2.new(1, 0, 0, 28)
+        btn.BackgroundColor3 = Color3.fromRGB(35, 35, 45)
+        btn.BorderSizePixel = 0
+        btn.LayoutOrder = order
+        btn.Text = ""
+        btn.AutoButtonColor = false
+        btn.Parent = scroll
+
+        local c = Instance.new("UICorner")
+        c.CornerRadius = UDim.new(0, 6)
+        c.Parent = btn
+
+        local lbl = Instance.new("TextLabel")
+        lbl.Size = UDim2.new(1, -120, 1, 0)
+        lbl.Position = UDim2.fromOffset(10, 0)
+        lbl.BackgroundTransparency = 1
+        lbl.Font = Enum.Font.GothamMedium
+        lbl.TextSize = 12
+        lbl.TextColor3 = Color3.fromRGB(220, 220, 230)
+        lbl.TextXAlignment = Enum.TextXAlignment.Left
+        lbl.Text = label
+        lbl.Parent = btn
+
+        local val = Instance.new("TextLabel")
+        val.Size = UDim2.fromOffset(100, 1)
+        val.Position = UDim2.new(1, -110, 0, 0)
+        val.BackgroundTransparency = 1
+        val.Font = Enum.Font.GothamBold
+        val.TextSize = 12
+        val.TextColor3 = Color3.fromRGB(100, 160, 255)
+        val.TextXAlignment = Enum.TextXAlignment.Right
+        val.Text = initial or options[1]
+        val.Parent = btn
+
+        local idx = 1
+        for i, o in ipairs(options) do
+            if o == initial then idx = i; break end
+        end
+        cfg[key] = options[idx]
+
+        btn.MouseButton1Click:Connect(function()
+            idx = idx % #options + 1
+            cfg[key] = options[idx]
+            val.Text = options[idx]
+        end)
+
+        return {
+            set = function(v)
+                for i, o in ipairs(options) do
+                    if o == v then idx = i; break end
+                end
+                cfg[key] = options[idx]
+                val.Text = options[idx]
+            end,
+        }
+    end
+
+    local function makeSlider(label, key, min, max, initial, step)
+        order = order + 1
+        local holder = Instance.new("TextButton")
+        holder.Size = UDim2.new(1, 0, 0, 36)
+        holder.BackgroundColor3 = Color3.fromRGB(35, 35, 45)
+        holder.BorderSizePixel = 0
+        holder.LayoutOrder = order
+        holder.Text = ""
+        holder.AutoButtonColor = false
+        holder.Parent = scroll
+
+        local c = Instance.new("UICorner")
+        c.CornerRadius = UDim.new(0, 6)
+        c.Parent = holder
+
+        local lbl = Instance.new("TextLabel")
+        lbl.Size = UDim2.new(1, -60, 0, 16)
+        lbl.Position = UDim2.fromOffset(10, 2)
+        lbl.BackgroundTransparency = 1
+        lbl.Font = Enum.Font.GothamMedium
+        lbl.TextSize = 12
+        lbl.TextColor3 = Color3.fromRGB(220, 220, 230)
+        lbl.TextXAlignment = Enum.TextXAlignment.Left
+        lbl.Text = label
+        lbl.Parent = holder
+
+        local val = Instance.new("TextLabel")
+        val.Size = UDim2.fromOffset(50, 16)
+        val.Position = UDim2.new(1, -60, 0, 2)
+        val.BackgroundTransparency = 1
+        val.Font = Enum.Font.GothamBold
+        val.TextSize = 12
+        val.TextColor3 = Color3.fromRGB(100, 160, 255)
+        val.TextXAlignment = Enum.TextXAlignment.Right
+        val.Text = tostring(initial)
+        val.Parent = holder
+
+        local track = Instance.new("Frame")
+        track.Size = UDim2.new(1, -20, 0, 6)
+        track.Position = UDim2.fromOffset(10, 24)
+        track.BackgroundColor3 = Color3.fromRGB(50, 50, 60)
+        track.BorderSizePixel = 0
+        track.Parent = holder
+
+        local tc = Instance.new("UICorner")
+        tc.CornerRadius = UDim.new(1, 0)
+        tc.Parent = track
+
+        local fill = Instance.new("Frame")
+        fill.Size = UDim2.new((initial - min) / (max - min), 0, 1, 0)
+        fill.BackgroundColor3 = Color3.fromRGB(100, 160, 255)
+        fill.BorderSizePixel = 0
+        fill.Parent = track
+
+        local fc = Instance.new("UICorner")
+        fc.CornerRadius = UDim.new(1, 0)
+        fc.Parent = fill
+
+        cfg[key] = initial
+
+        local dragging = false
+        local function setFromX(x)
+            local frac = math.clamp((x - track.AbsolutePosition.X) / track.AbsoluteSize.X, 0, 1)
+            local v = min + (max - min) * frac
+            if step then v = math.floor(v / step + 0.5) * step end
+            cfg[key] = v
+            fill.Size = UDim2.new(frac, 0, 1, 0)
+            val.Text = tostring(v)
+        end
+
+        track.InputBegan:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1
+                or input.UserInputType == Enum.UserInputType.Touch then
+                dragging = true
+                setFromX(input.Position.X)
+            end
+        end)
+        local endConn = game:GetService("UserInputService").InputEnded:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1
+                or input.UserInputType == Enum.UserInputType.Touch then
+                dragging = false
+            end
+        end)
+        local moveConn = game:GetService("UserInputService").InputChanged:Connect(function(input)
+            if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+                or input.UserInputType == Enum.UserInputType.Touch) then
+                setFromX(input.Position.X)
+            end
+        end)
+
+        return {
+            set = function(v)
+                v = math.clamp(v, min, max)
+                cfg[key] = v
+                fill.Size = UDim2.new((v - min) / (max - min), 0, 1, 0)
+                val.Text = tostring(v)
+            end,
+        }
+    end
+
+    -- ===== заполнение GUI =====
+    local handle = {}
+
+    handle.enabled = makeToggle("enabled (ragebot)", "enabled", cfg.enabled)
+    handle.auto_fire = makeToggle("auto fire", "auto_fire", cfg.auto_fire)
+    handle.autowall = makeToggle("autowall", "autowall", cfg.autowall)
+    handle.wallbang = makeToggle("wallbang (подмена Hits)", "wallbang", cfg.wallbang)
+    handle.pen_mod = makeToggle("penMod (override penetration)", "pen_mod", cfg.pen_mod)
+    handle.bullet_tp = makeToggle("bullet TP", "bullet_tp", cfg.bullet_tp)
+    handle.tap_kill = makeToggle("tap kill", "tap_kill", cfg.tap_kill)
+    handle.double_tap = makeToggle("double tap", "double_tap", cfg.double_tap)
+    handle.multi = makeToggle("multi-target", "multi", cfg.multi)
+    handle.sticky = makeToggle("sticky target", "sticky", cfg.sticky)
+    handle.miss_adapt = makeToggle("miss adapt", "miss_adapt", cfg.miss_adapt)
+    handle.backtrack = makeToggle("backtrack", "backtrack", cfg.backtrack)
+    handle.forward_track = makeToggle("forward track", "forward_track", cfg.forward_track)
+    handle.prefer_body_lethal = makeToggle("prefer body lethal", "prefer_body_lethal", cfg.prefer_body_lethal)
+    handle.force_body = makeToggle("force body", "force_body", cfg.force_body)
+    handle.team_check = makeToggle("team check", "team_check", cfg.team_check)
+
+    handle.hitbox = makeDropdown("hitbox", "hitbox",
+        { "Head", "Body", "Multipoint", "Full Body" }, cfg.hitbox)
+    handle.target_mode = makeDropdown("target mode", "target_mode",
+        { "Distance", "Crosshair", "Lowest HP" }, cfg.target_mode)
+
+    handle.min_dmg = makeSlider("min damage", "min_dmg", 1, 100, cfg.min_dmg, 1)
+    handle.scan_hz = makeSlider("scan Hz", "scan_hz", 5, 60, cfg.scan_hz, 1)
+    handle.predict_ms = makeSlider("predict ms", "predict_ms", 0, 200, cfg.predict_ms, 5)
+    handle.backtrack_ms = makeSlider("backtrack ms", "backtrack_ms", 50, 500, cfg.backtrack_ms, 10)
+    handle.forward_ms = makeSlider("forward ms", "forward_ms", 20, 300, cfg.forward_ms, 10)
+    handle.pen_value = makeSlider("pen value", "pen_value", 1, 50, cfg.pen_value, 1)
+
+    getgenv().rage_gui_handle = handle
+
+    -- ===== статус внизу =====
+    local statusLabel = Instance.new("TextLabel")
+    statusLabel.Size = UDim2.new(1, -20, 0, 20)
+    statusLabel.Position = UDim2.new(0, 10, 1, -22)
+    statusLabel.BackgroundTransparency = 1
+    statusLabel.Font = Enum.Font.GothamMono
+    statusLabel.TextSize = 11
+    statusLabel.TextColor3 = Color3.fromRGB(150, 150, 165)
+    statusLabel.TextXAlignment = Enum.TextXAlignment.Left
+    statusLabel.Text = "ready"
+    statusLabel.Parent = frame
+
+    task.spawn(function()
+        while getgenv().rage_gui == gui and frame.Parent do
+            local stats = getgenv().rage.stats()
+            local gun = stats.gun and "gun" or "NO GUN"
+            statusLabel.Text = ("srv=%s targets=%d %s"):format(
+                tostring(stats.server), stats.targets, gun)
+            task.wait(0.25)
+        end
+    end)
+
+    return gui, frame
+end
+
+-- ===== автозапуск GUI =====
+local ok, gui = pcall(ensureGui)
+if ok and gui then
+    print("[rage] GUI ready, toggle key: INSERT")
+else
+    print("[rage] GUI failed: " .. tostring(gui))
+end
+
+-- toggle key — Insert
+local UserInput = game:GetService("UserInputService")
+UserInput.InputBegan:Connect(function(input, processed)
+    if processed then return end
+    if input.KeyCode == Enum.KeyCode.Insert then
+        local g = getgenv().rage_gui
+        if g then g.Enabled = not g.Enabled end
+    end
+end)
+
+print("[rage] ready 7/7 | srv=" .. tostring(server.hits))
+print("[rage] toggle GUI: INSERT")
+print("[rage] unload: getgenv().rage.unload()")
