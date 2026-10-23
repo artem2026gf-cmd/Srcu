@@ -1,0 +1,937 @@
+-- ragebot.lua — часть 1/4: boot + config + entities + team/enemy + raycast
+print("[rage] boot 1/4")
+
+local Players = game:GetService("Players")
+local Replicated = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local HttpService = game:GetService("HttpService")
+local Camera = workspace.CurrentCamera
+local LocalPlayer = Players.LocalPlayer
+
+for _, k in ipairs({"zaml_aim", "zaml_rage", "cf_aim", "rage"}) do
+    local s = getgenv()[k]
+    if type(s) == "table" and type(s.unload) == "function" then pcall(s.unload) end
+end
+getgenv().rage = nil
+
+local cfg = {
+    enabled = true, auto_fire = true,
+    hitbox = "Head", target_mode = "Distance",
+    max_dist = math.huge, min_dmg = 20,
+    min_dmg_override = false, min_dmg_override_value = 5,
+    force_body = false, prefer_body_lethal = true,
+    scan_hz = 30, sticky = false,
+    autowall = true, wallbang = false, wall_limit = false, max_walls = 1,
+    pen_mod = false, pen_value = 10,
+    bullet_tp = false, bullet_tp_dist = 2,
+    predict_ms = 0, origin_on = false,
+    origin_x = 0, origin_y = 0, origin_z = 0,
+    backtrack = false, backtrack_ms = 200,
+    forward_track = false, forward_ms = 100,
+    tap_kill = false, max_taps = 3, double_tap = false,
+    multi = false, team_check = false, ignore_friends = false,
+}
+getgenv().rage = cfg
+
+local function req(...)
+    local node = Replicated
+    for _, seg in ipairs({...}) do
+        node = node and node:FindFirstChild(seg)
+        if not node then return nil end
+    end
+    local ok, m = pcall(require, node)
+    return ok and m or nil
+end
+
+local Remotes = req("Database", "Security", "Remotes")
+if not (Remotes and Remotes.Inventory and Remotes.Inventory.ShootWeapon
+        and type(Remotes.Inventory.ShootWeapon.Send) == "function") then
+    cfg.enabled = false
+    print("[rage] CRITICAL: ShootWeapon.Send missing")
+    return
+end
+
+local GetRayIgnore = req("Components", "Common", "GetRayIgnore")
+local CharacterController = req("Controllers", "CharacterController")
+local HordeController = req("Controllers", "HordeController")
+local Participants = req("Components", "Common", "Participants")
+local SharedRaycast = req("Shared", "Raycast")
+
+print("[rage] deps: CC=" .. tostring(CharacterController ~= nil)
+    .. " Participants=" .. tostring(Participants ~= nil))
+
+local getTID = getthreadidentity or (syn and syn.get_thread_identity)
+local setTID = setthreadidentity or (syn and syn.set_thread_identity)
+local function withIdentity(fn, ...)
+    local tid = getTID and getTID()
+    local ok, a, b = pcall(fn, ...)
+    if tid and setTID then pcall(setTID, tid) end
+    return ok, a, b
+end
+
+-- ===== server detect =====
+local server = { hits = false, router = nil }
+pcall(function() server.router = req("Database", "Security", "Router") end)
+
+function server.viewTick()
+    if not server.router then return nil end
+    local ok, v = pcall(server.router.broadcastRouter, "GetRemoteViewTick")
+    return ok and type(v) == "number" and v or nil
+end
+
+function server.setHits(v) server.hits = v end
+
+pcall(function()
+    if type(SharedRaycast) == "table"
+        and type(rawget(SharedRaycast, "castThroughDistance")) == "function" then
+        server.setHits(true)
+    end
+end)
+
+task.spawn(function()
+    for _ = 1, 40 do
+        if not getgenv().rage or server.hits then return end
+        if server.viewTick() then server.setHits(true); return end
+        task.wait(3)
+    end
+end)
+
+print("[rage] server_hits=" .. tostring(server.hits))
+
+-- ===== helpers =====
+local function U() return Camera.CFrame end
+
+local function LT()
+    local cf = U()
+    if not cfg.origin_on then return cf.Position end
+    local _, yaw = cf:ToEulerAnglesYXZ()
+    return cf.Position + (CFrame.Angles(0, yaw, 0)):VectorToWorldSpace(
+        Vector3.new(cfg.origin_x, cfg.origin_y, cfg.origin_z))
+end
+
+local function getSlot()
+    if not CharacterController or type(CharacterController.getInventorySlot) ~= "function" then
+        return nil
+    end
+    local ok, up = pcall(debug.getupvalue, CharacterController.getInventorySlot, 1)
+    if ok and type(up) == "table" then
+        return rawget(up, "CurrentEquipped")
+    end
+    return nil
+end
+
+local function uT(props)
+    if server.hits then return props and props.Penetration or 0 end
+    if cfg.wall_limit then return math.huge end
+    if cfg.pen_mod then return cfg.pen_value end
+    return props and props.Penetration or 0
+end
+
+local function minDmg()
+    return cfg.min_dmg_override and cfg.min_dmg_override_value or cfg.min_dmg
+end
+
+-- ===== entities =====
+local botCache = setmetatable({}, { __mode = "k" })
+local function wrapBot(inst)
+    if not Participants then return nil end
+    local c = botCache[inst]; if c then return c end
+    local w = setmetatable({ IsBot = true, UserId = 0 }, {
+        __index = function(_, key)
+            if key == "Character" then
+                local ok, v = withIdentity(Participants.Character, inst)
+                return ok and v or nil
+            elseif key == "Name" or key == "DisplayName" then
+                local ok, v = withIdentity(Participants.Name, inst)
+                return (ok and type(v) == "string") and v or inst.Name
+            elseif key == "Parent" then return inst.Parent end
+            return nil
+        end,
+    })
+    function w.GetAttribute(_, key)
+        local v = inst:GetAttribute(key)
+        if v == nil then
+            local ok, ch = withIdentity(Participants.Character, inst)
+            if ok and ch then v = ch:GetAttribute(key) end
+        end
+        return v
+    end
+    botCache[inst] = w
+    return w
+end
+
+local zombieCache = setmetatable({}, { __mode = "k" })
+local function wrapZombie(model)
+    local r = zombieCache[model]; if r then return r end
+    r = { IsZombie = true, IsBot = true, UserId = 0, Name = "zombie",
+          DisplayName = "zombie", Character = model, Parent = model.Parent }
+    function r.GetAttribute(_, key) return model:GetAttribute(key) end
+    zombieCache[model] = r
+    return r
+end
+
+local function liveShells()
+    local out = {}
+    if HordeController and type(HordeController.GetLiveShells) == "function" then
+        local ok, list = withIdentity(HordeController.GetLiveShells)
+        if ok and type(list) == "table" then
+            for _, s in pairs(list) do
+                if typeof(s) == "Instance" and s.Parent and s:FindFirstChild("Head") then
+                    out[#out + 1] = s
+                end
+            end
+            return out
+        end
+    end
+    local hh = workspace:FindFirstChild("HordeShells")
+    for _, s in ipairs(hh and hh:GetChildren() or {}) do
+        if s:IsA("Model") and s:GetAttribute("HordeId") ~= nil
+            and not s:GetAttribute("Ragdolled") and s:FindFirstChild("Head") then
+            out[#out + 1] = s
+        end
+    end
+    return out
+end
+
+local entCache, entAt = nil, 0
+local function entities()
+    local now = os.clock()
+    if entCache and now - entAt < 0.2 then return entCache end
+    entAt = now
+    local out = {}
+    for _, p in ipairs(Players:GetPlayers()) do out[#out + 1] = p end
+    if Participants then
+        local ok, list = withIdentity(Participants.GetAll)
+        if ok and type(list) == "table" then
+            for _, e in pairs(list) do
+                if typeof(e) == "Instance" and not e:IsA("Player") then
+                    local w = wrapBot(e)
+                    if w then out[#out + 1] = w end
+                end
+            end
+        end
+    end
+    for _, s in ipairs(liveShells()) do out[#out + 1] = wrapZombie(s) end
+    entCache = out
+    return out
+end
+
+local friendCache = setmetatable({}, { __mode = "k" })
+local function checkFriend(plr)
+    if plr == LocalPlayer or friendCache[plr] ~= nil then return end
+    friendCache[plr] = false
+    task.spawn(function()
+        local ok, v = pcall(LocalPlayer.IsFriendsWith, LocalPlayer, plr.UserId)
+        friendCache[plr] = ok and v == true
+    end)
+end
+for _, p in ipairs(Players:GetPlayers()) do checkFriend(p) end
+pcall(function() Players.PlayerAdded:Connect(checkFriend) end)
+
+-- ===== team/enemy =====
+local function isEnemy(a)
+    if a == LocalPlayer then return false end
+    if type(a) == "table" and a.IsZombie then return true end
+    if workspace:FindFirstChild("HordeShells") then return false end
+    if not cfg.team_check then return true end
+    if type(a) == "table" and a.IsBot then
+        local t = a:GetAttribute("Team")
+        local mt = LocalPlayer:GetAttribute("Team")
+        if t == nil or mt == nil then return true end
+        return t ~= mt
+    end
+    if cfg.ignore_friends and friendCache[a] then return false end
+    if workspace:GetAttribute("Gamemode") == "Deathmatch" then return true end
+    local t = a:GetAttribute("Team")
+    return (t == "Terrorists" or t == "Counter-Terrorists")
+        and t ~= LocalPlayer:GetAttribute("Team")
+end
+
+local function character(a, part)
+    local c = a.Character; if not c then return nil end
+    if c:GetAttribute("Dead") or c:GetAttribute("Ragdolled") then return nil end
+    local hp = c:GetAttribute("Health")
+    if type(hp) == "number" and hp <= 0 then return nil end
+    if not c:IsDescendantOf(workspace) then return nil end
+    if not c:FindFirstChild(part or "Head") then return nil end
+    return c
+end
+
+local function isInvincible(c)
+    if not c then return false end
+    return c:GetAttribute("Invincible") == true
+end
+
+local function enemyFilter(a)
+    if not isEnemy(a) then return false end
+    if cfg.ignore_friends and friendCache[a] then return false end
+    return true
+end
+
+-- ===== raycast =====
+local MATERIAL_HARDNESS = {
+    [Enum.Material.Plastic] = 10, [Enum.Material.SmoothPlastic] = 10,
+    [Enum.Material.Wood] = 10, [Enum.Material.WoodPlanks] = 10,
+    [Enum.Material.Cardboard] = 10, [Enum.Material.Glass] = 25,
+    [Enum.Material.Fabric] = 25,
+}
+local VARIANT_HARDNESS = { ["Sandy Brick"] = 0, IndoorWall = 0 }
+
+local function hardness(mv)
+    if mv ~= 0 then return mv end
+    if workspace:GetAttribute("Map") == "Reactor" then return -1 end
+    return mv
+end
+
+local function effectiveMaterial(inst)
+    local p = inst.Parent
+    if p and p:HasTag("BreakableDoor") then return Enum.Material.Metal end
+    return inst.Material
+end
+
+local function isCharacterPart(inst)
+    return inst:FindFirstAncestorWhichIsA("Accessory") ~= nil
+        or inst:HasTag("CharacterAccessory")
+        or inst.Name == "CollisionCapsule"
+        or inst.Name == "HumanoidRootPart"
+end
+
+local bulletRay = RaycastParams.new()
+bulletRay.FilterType = Enum.RaycastFilterType.Exclude
+bulletRay.CollisionGroup = "Bullet"
+local exitRay = RaycastParams.new()
+exitRay.FilterType = Enum.RaycastFilterType.Include
+exitRay.CollisionGroup = "Bullet"
+
+local riCache = { at = 0, list = nil, char = nil }
+local function rayIgnore()
+    local now = os.clock()
+    local ch = LocalPlayer.Character
+    if riCache.list and riCache.char == ch and now - riCache.at < 0.1 then
+        return riCache.list
+    end
+    riCache.at, riCache.char = now, ch
+    local list = {}
+    if GetRayIgnore then
+        local ok, r = withIdentity(GetRayIgnore)
+        if ok and type(r) == "table" then
+            for _, v in ipairs(r) do list[#list + 1] = v end
+        end
+    end
+    if LocalPlayer.Character then list[#list + 1] = LocalPlayer.Character end
+    list[#list + 1] = Camera
+    riCache.list = list
+    return list
+end
+
+local function makeHit(h, isExit)
+    return {
+        Instance = h.Instance, Position = h.Position,
+        Normal = isExit and -h.Normal or h.Normal,
+        Material = h.Instance.Material.Name, Exit = isExit == true,
+    }
+end
+
+local function raycastWalk(origin, dir, maxDist, pen, targetChar)
+    bulletRay.FilterDescendantsInstances = rayIgnore()
+    local hits, accum, walls, cursor = {}, {}, 0, origin
+    for _ = 1, 64 do
+        local remaining = maxDist - (cursor - origin).Magnitude
+        if remaining <= 0 then break end
+        local hit = workspace:Raycast(cursor, dir * remaining, bulletRay)
+        if not hit then break end
+        bulletRay:AddToFilter(hit.Instance)
+        if not isCharacterPart(hit.Instance) then
+            hits[#hits + 1] = makeHit(hit, false)
+            if targetChar and hit.Instance:IsDescendantOf(targetChar) then
+                return hits, true, walls
+            end
+            if pen == math.huge then
+                walls = walls + 1
+                cursor = hit.Position + dir * 0.01
+            else
+                exitRay.FilterDescendantsInstances = { hit.Instance }
+                local far = hit.Position + dir * 1000
+                local back = workspace:Raycast(far, hit.Position - far, exitRay)
+                if not back then return hits, false, walls, true end
+                local thickness = (hit.Position - back.Position).Magnitude
+                local variant = hit.Instance.MaterialVariant
+                local key, limit
+                if variant ~= "" and VARIANT_HARDNESS[variant] ~= nil then
+                    key = variant
+                    limit = hardness(VARIANT_HARDNESS[key]) + pen
+                else
+                    key = effectiveMaterial(hit.Instance)
+                    limit = hardness(MATERIAL_HARDNESS[key] or 0) + pen
+                end
+                accum[key] = (accum[key] or 0) + thickness
+                if accum[key] > limit then return hits, false, walls, true end
+                hits[#hits + 1] = makeHit(back, true)
+                walls = walls + 1
+                cursor = back.Position + dir * 0.001
+            end
+        end
+    end
+    return hits, false, walls
+end
+
+local function mT(origin, target, maxDist, pen)
+    local delta = target - origin
+    local dist = delta.Magnitude
+    if dist < 0.05 or dist > maxDist then return false, 0 end
+    local hits, hitTarget, _, overWall = raycastWalk(origin, delta.Unit, dist, pen, nil)
+    if overWall then return false, hitTarget end
+    return true, hitTarget, hits
+end
+
+local function jT(origin, target, targetPart, maxDist, pen, wallbang)
+    local hit, _, hits = mT(origin, target, maxDist, pen)
+    if not hit then
+        if not wallbang or server.hits then return nil end
+        hits = {}
+    end
+    local dir = (target - origin).Unit
+    hits[#hits + 1] = {
+        Instance = targetPart, Position = target,
+        Normal = -dir, Material = targetPart.Material.Name, Exit = false,
+    }
+    return hits
+end
+
+local function kT(origin, hits)
+    local cursor = origin
+    for _, h in ipairs(hits) do
+        h.Distance = (h.Position - cursor).Magnitude
+        cursor = h.Position
+    end
+    return hits
+end
+
+print("[rage] part 1/4 ready")
+-- часть 2/4 — damage + calibration + bulletTP + autowall
+
+local ZONE_MAP = {
+    Head = "Head",
+    UpperTorso = "Torso", LowerTorso = "Torso", HumanoidRootPart = "Torso", Torso = "Torso",
+    LeftUpperArm = "Arms", LeftLowerArm = "Arms", LeftHand = "Arms",
+    RightUpperArm = "Arms", RightLowerArm = "Arms", RightHand = "Arms",
+    LeftUpperLeg = "Legs", LeftLowerLeg = "Legs", LeftFoot = "Legs",
+    RightUpperLeg = "Legs", RightLowerLeg = "Legs", RightFoot = "Legs",
+}
+
+local HITBOX = {
+    Head = { "Head" },
+    Body = { "UpperTorso", "LowerTorso", "HumanoidRootPart" },
+    Multipoint = { "Head", "UpperTorso", "LowerTorso", "HumanoidRootPart" },
+    ["Full Body"] = {
+        "Head", "UpperTorso", "LowerTorso",
+        "LeftUpperArm", "LeftLowerArm", "LeftHand",
+        "RightUpperArm", "RightLowerArm", "RightHand",
+        "LeftUpperLeg", "LeftLowerLeg", "LeftFoot",
+        "RightUpperLeg", "RightLowerLeg", "RightFoot",
+    },
+}
+
+local DIST_SCALE = 0.075
+
+local function parseArmor(owner)
+    local raw = owner:GetAttribute("Armor")
+    if type(raw) ~= "string" then return 0, false end
+    local ok, m = pcall(HttpService.JSONDecode, HttpService, raw)
+    if not ok or type(m) ~= "table" then return 0, false end
+    return tonumber(m.Health) or 0, type(m.Type) == "string" and m.Type:find("Helmet") ~= nil
+end
+
+local function calcDamage(gun, partName, dist, walls, owner)
+    local zone = ZONE_MAP[partName]
+    local tbl = gun.DamagePerPart
+    if not zone or type(tbl) ~= "table" or not tbl[zone] then return 0 end
+    local dmg = tbl[zone]
+    dmg = dmg * (gun.RangeModifier or 1) ^ ((dist / DIST_SCALE) / 500)
+    if walls > 0 then dmg = dmg * (gun.WallbangMultiplier or 0.5) ^ walls end
+    local armorHp, helmet = parseArmor(owner)
+    if armorHp > 0 and (zone ~= "Legs" and (zone ~= "Head" or helmet)) then
+        dmg = dmg * (gun.ArmorPenetration or 1)
+    end
+    return dmg * (gun.BulletsPerShot or 1)
+end
+
+-- ===== calibration =====
+local calib = { factor = {}, samples = {}, pending = {} }
+do
+    local path = "zaml/bloxstrike/damage_calibration.json"
+    pcall(function()
+        if type(isfile) == "function" and isfile(path) then
+            local ok, data = pcall(HttpService.JSONDecode, HttpService, readfile(path))
+            if ok and type(data) == "table" then
+                calib.factor = data.factor or {}
+                calib.samples = data.samples or {}
+            end
+        end
+    end)
+    local dirty, dirtyAt = false, 0
+    local function save()
+        pcall(function()
+            if type(isfolder) == "function" and type(makefolder) == "function"
+                and not isfolder("zaml/bloxstrike") then
+                if not isfolder("zaml") then makefolder("zaml") end
+                makefolder("zaml/bloxstrike")
+            end
+            if type(writefile) == "function" then
+                writefile(path, HttpService:JSONEncode({
+                    factor = calib.factor, samples = calib.samples,
+                }))
+            end
+        end)
+        dirty = false
+    end
+    function calib.key(gunName, zone, walls)
+        return tostring(gunName) .. "|" .. tostring(zone)
+            .. "|" .. ((walls or 0) > 0 and "wall" or "open")
+    end
+    function calib.get(key) return math.clamp(calib.factor[key] or 1, 0.6, 1.4) end
+    function calib.expect(plr, key, raw) calib.pending[plr] = { key = key, raw = raw, at = os.clock() } end
+    function calib.observe(plr, actual, hpBefore)
+        local m = calib.pending[plr]; calib.pending[plr] = nil
+        if not m or os.clock() - m.at > 1.5 or not m.raw or m.raw <= 0 then return end
+        if hpBefore and m.raw >= hpBefore then return end
+        local observed = math.clamp(actual / m.raw, 0.05, 2)
+        local n = (calib.samples[m.key] or 0) + 1
+        local old = calib.factor[m.key] or observed
+        local alpha = n <= 3 and (1 / n) or 0.3
+        calib.factor[m.key] = old + (observed - old) * alpha
+        calib.samples[m.key] = n
+        dirty = true
+        if os.clock() - dirtyAt > 10 then
+            dirtyAt = os.clock()
+            task.delay(10, function() if dirty then save() end end)
+        end
+    end
+end
+
+local function applyCalib(gunName, partName, walls, raw)
+    local key = calib.key(gunName, ZONE_MAP[partName], walls)
+    if server.hits then return raw, key end
+    return raw * calib.get(key), key
+end
+
+-- ===== bullet TP =====
+local euRay = RaycastParams.new()
+euRay.FilterType = Enum.RaycastFilterType.Exclude
+euRay.CollisionGroup = "Bullet"
+local euLast = setmetatable({}, { __mode = "k" })
+local euStamp = nil
+
+local function bulletTP(part)
+    if not cfg.bullet_tp or not part or not part.Parent then return nil end
+    local pp = part.Position
+    local delta = U().Position - pp
+    local flat = Vector3.new(delta.X, 0, delta.Z)
+    flat = flat.Magnitude > 0.01 and flat.Unit or Vector3.new(0, 0, 1)
+    local side, up, dist = flat:Cross(Vector3.new(0, 1, 0)), Vector3.new(0, 1, 0), cfg.bullet_tp_dist
+    local dirs = { flat, (flat + up).Unit, up, side, -side,
+        (flat + side).Unit, (flat - side).Unit, -flat }
+    if not euStamp or os.clock() - euStamp > 0.1 then
+        euRay.FilterDescendantsInstances = rayIgnore()
+        euStamp = os.clock()
+    end
+    local parent = part.Parent
+    local last = euLast[part] or 1
+    for k = 0, #dirs - 1 do
+        local idx = ((last - 1) + k) % #dirs + 1
+        local d = dirs[idx]
+        local origin = pp + d * dist
+        local hit = workspace:Raycast(origin, d * -(dist + 2), euRay)
+        if hit and hit.Instance:IsDescendantOf(parent) then
+            euLast[part] = idx
+            return origin
+        end
+    end
+    return nil
+end
+
+-- ===== autowall =====
+local function autowall(origin, part, char, pen, range)
+    local dir = (part.Position - origin).Unit
+    local _, hitTarget, walls = raycastWalk(origin, dir, range, pen, char.Parent)
+    if hitTarget then
+        if walls > 0 and (not cfg.autowall and (server.hits or (not cfg.wallbang and not cfg.wall_limit))) then
+            return false, 0
+        end
+        return true, walls
+    end
+    if cfg.wallbang and not server.hits then
+        local _, _, w2 = raycastWalk(origin, dir, range, math.huge, char.Parent)
+        return true, w2
+    end
+    return false, 0
+end
+
+print("[rage] part 2/4 ready")
+-- часть 3/4 — scan + backtrack + forwardtrack
+
+local velTrack, velLast = setmetatable({}, { __mode = "k" }), setmetatable({}, { __mode = "k" })
+
+local function trackVelocity(dt)
+    if dt <= 0 then return end
+    for _, plr in ipairs(entities()) do
+        local ch = plr.Character
+        local root = ch and ch:FindFirstChild("HumanoidRootPart")
+        if root then
+            local pos = root.Position
+            local prev = velLast[plr]
+            if prev then
+                local v = (pos - prev) / dt
+                if v.Magnitude > 80 then v = Vector3.zero end
+                velTrack[plr] = (velTrack[plr] or v):Lerp(v, 0.35)
+            end
+            velLast[plr] = pos
+        else
+            velLast[plr], velTrack[plr] = nil, nil
+        end
+    end
+end
+
+local function predict(part)
+    local ms = cfg.predict_ms or 0
+    if ms <= 0 or not part.Parent then return part.Position end
+    local own = nil
+    for _, e in ipairs(entities()) do
+        if e.Character == part.Parent then own = e; break end
+    end
+    local v = own and velTrack[own]
+    if not v then return part.Position end
+    return part.Position + Vector3.new(v.X, v.Y * 0.5, v.Z) * (ms / 1000)
+end
+
+local ALL_PARTS = {
+    "Head", "UpperTorso", "LowerTorso",
+    "LeftUpperArm", "LeftLowerArm", "LeftHand",
+    "RightUpperArm", "RightLowerArm", "RightHand",
+    "LeftUpperLeg", "LeftLowerLeg", "LeftFoot",
+    "RightUpperLeg", "RightLowerLeg", "RightFoot",
+}
+
+local backtrackBuf = setmetatable({}, { __mode = "k" })
+local BACKTRACK_WINDOW = 0.6
+
+local function trackBacktrack()
+    if not cfg.backtrack then
+        for k in pairs(backtrackBuf) do backtrackBuf[k] = nil end
+        return
+    end
+    for _, plr in ipairs(entities()) do
+        local ch = plr.Character
+        local root = ch and ch:FindFirstChild("HumanoidRootPart")
+        if root then
+            local buf = backtrackBuf[plr]
+            if not buf then buf = {}; backtrackBuf[plr] = buf end
+            local frame = { t = os.clock(), pos = {} }
+            for _, pn in ipairs(ALL_PARTS) do
+                local pt = ch:FindFirstChild(pn)
+                if pt then frame.pos[pn] = pt.Position end
+            end
+            frame.pos.HumanoidRootPart = root.Position
+            buf[#buf + 1] = frame
+            while buf[1] and frame.t - buf[1].t > BACKTRACK_WINDOW do
+                table.remove(buf, 1)
+            end
+        elseif backtrackBuf[plr] then
+            backtrackBuf[plr] = nil
+        end
+    end
+end
+
+local scanCache, scanAt = {}, 0
+local currentTarget = nil
+
+local function scan(gun)
+    local now = os.clock()
+    if now - scanAt < 1 / math.max(cfg.scan_hz, 1) then
+        for i = #scanCache, 1, -1 do
+            local s = scanCache[i]
+            if not s.part.Parent or s.char:GetAttribute("Dead") or isInvincible(s.char) then
+                table.remove(scanCache, i)
+            end
+        end
+        return scanCache
+    end
+    scanAt = now
+
+    local origin = LT()
+    local range = gun.Properties.Range or 500
+    local pen = uT(gun.Properties)
+    local vp = Camera.ViewportSize / 2
+    local threshold = minDmg()
+
+    local candidates = {}
+    for _, plr in ipairs(entities()) do
+        if enemyFilter(plr) then
+            local ch = character(plr, "HumanoidRootPart")
+            if ch and not isInvincible(ch) then
+                local dist = (ch.HumanoidRootPart.Position - origin).Magnitude
+                if dist < cfg.max_dist then
+                    local hp = tonumber(ch:GetAttribute("Health")) or 100
+                    local score = dist
+                    if cfg.target_mode == "Crosshair" then
+                        local v, on = Camera:WorldToViewportPoint(ch.HumanoidRootPart.Position)
+                        score = on and (Vector2.new(v.X, v.Y) - vp).Magnitude or math.huge
+                    elseif cfg.target_mode == "Lowest HP" then
+                        score = hp + dist / 10000
+                    end
+                    if cfg.sticky and plr == currentTarget then score = -math.huge end
+                    candidates[#candidates + 1] = {
+                        player = plr, char = ch, dist = dist, hp = hp, score = score,
+                    }
+                end
+            end
+        end
+    end
+    table.sort(candidates, function(a, b) return a.score < b.score end)
+
+    local results = {}
+    local hitboxList = HITBOX[cfg.hitbox] or HITBOX.Head
+    if cfg.force_body then hitboxList = HITBOX.Body end
+
+    for _, cand in ipairs(candidates) do
+        local hp = cand.hp
+        local best, bestBody = { dmg = 0 }, { dmg = 0 }
+
+        for _, partName in ipairs(hitboxList) do
+            local part = cand.char:FindFirstChild(partName)
+            if part then
+                local ok, walls = autowall(origin, part, cand.char, pen, range)
+                if ok and (not cfg.wall_limit or walls <= cfg.max_walls) then
+                    local raw = calcDamage(gun, partName, (part.Position - origin).Magnitude,
+                        (cfg.wall_limit and not server.hits) and 0 or walls, cand.player)
+                    local dmg = applyCalib(gun.Name, partName, walls, raw)
+                    if dmg > best.dmg then best = { part = part, dmg = dmg, walls = walls } end
+                    if ZONE_MAP[partName] == "Torso" and dmg > bestBody.dmg then
+                        bestBody = { part = part, dmg = dmg, walls = walls }
+                    end
+                    if bestBody.dmg >= hp or (best.dmg >= hp and not cfg.prefer_body_lethal) then
+                        break
+                    end
+                end
+            end
+        end
+
+        if cfg.prefer_body_lethal and bestBody.part and bestBody.dmg >= hp then
+            best = bestBody
+        end
+
+        if (not best.part or (best.dmg < threshold and best.dmg < hp)) and cfg.backtrack then
+            local buf = backtrackBuf[cand.player]
+            if buf then
+                for i = #buf - 1, 1, -2 do
+                    local frame = buf[i]
+                    local age = (os.clock() - frame.t) * 1000
+                    if age > cfg.backtrack_ms then break end
+                    for _, partName in ipairs(hitboxList) do
+                        local part = cand.char:FindFirstChild(partName)
+                        local pastPos = frame.pos[partName]
+                        if part and pastPos then
+                            local dist = (pastPos - origin).Magnitude
+                            if dist < range then
+                                local ok, walls = autowall(origin,
+                                    { Position = pastPos, Parent = cand.char, Material = part.Material },
+                                    cand.char, pen, range)
+                                if ok then
+                                    local raw = calcDamage(gun, partName, dist,
+                                        (cfg.wall_limit and not server.hits) and 0 or walls, cand.player)
+                                    local dmg = applyCalib(gun.Name, partName, walls, raw)
+                                    if dmg > best.dmg then
+                                        best = { part = part, dmg = dmg, walls = walls, pos = pastPos }
+                                    end
+                                end
+                            end
+                        end
+                    end
+                    if best.pos and best.dmg >= hp then break end
+                end
+            end
+        end
+
+        if (not best.part or (best.dmg < threshold and best.dmg < hp)) and cfg.forward_track then
+            local v = velTrack[cand.player]
+            if v and v.Magnitude > 1 then
+                for _, mult in ipairs({ 0.5, 1 }) do
+                    local ms = cfg.forward_ms * mult
+                    for _, partName in ipairs(hitboxList) do
+                        local part = cand.char:FindFirstChild(partName)
+                        if part then
+                            local futurePos = part.Position + v * (ms / 1000)
+                            local dist = (futurePos - origin).Magnitude
+                            if dist < range then
+                                local dir = (futurePos - origin).Unit
+                                local ok = workspace:Raycast(origin, dir * dist, rayIgnore()) == nil
+                                if ok then
+                                    local raw = calcDamage(gun, partName, dist, 0, cand.player)
+                                    local dmg = applyCalib(gun.Name, partName, 0, raw)
+                                    if dmg > best.dmg then
+                                        best = { part = part, dmg = dmg, walls = 0, pos = futurePos }
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+
+        if best.part and (best.dmg >= threshold or best.dmg >= hp) then
+            best.player, best.char, best.hp = cand.player, cand.char, hp
+            results[#results + 1] = best
+            if not cfg.multi then break end
+        end
+    end
+
+    currentTarget = results[1] and results[1].player or nil
+    scanCache = results
+    return results
+end
+
+print("[rage] part 3/4 ready")
+-- часть 4/4 — fire + Send hook (С ФИКСОМ РЕКУРСИИ) + Heartbeat + unload
+
+local function fireRate(gun)
+    local fr = type(gun.Properties) == "table" and gun.Properties.FireRate or nil
+    if type(fr) == "number" and fr > 0 then return fr end
+    return 0.1
+end
+
+local lastFire = 0
+
+local function fire(gun, target)
+    local props = gun.Properties
+    if not (props and gun.Identifier and target and target.part) then return false end
+
+    local origin = bulletTP(target.part) or LT()
+    local targetPos = target.pos or predict(target.part)
+    local dir = targetPos - origin
+    if dir.Magnitude < 0.05 then return false end
+    dir = dir.Unit
+
+    local range = props.Range or 500
+    local pen = uT(props)
+    local bullets = {}
+
+    for i = 1, math.max(props.BulletsPerShot or 1, 1) do
+        if server.hits then
+            bullets[i] = { Direction = dir, Origin = origin }
+        else
+            local hits = jT(origin, targetPos, target.part, range, pen, cfg.wallbang)
+            if not hits then return false end
+            bullets[i] = { Direction = dir, Origin = origin, Hits = kT(origin, hits) }
+        end
+    end
+
+    gun.ShotSeq = (gun.ShotSeq or 0) + 1
+    local packet = {
+        IsSniperScoped = gun.IsSniperScoped,
+        ShootingHand = gun.ShootingHand,
+        Identifier = gun.Identifier,
+        Seq = gun.ShotSeq,
+        Bullets = bullets,
+        ViewTick = server.hits and server.viewTick() or nil,
+        __cf_rage = true,
+    }
+
+    local ok = pcall(Remotes.Inventory.ShootWeapon.Send, packet)
+    if ok then
+        gun.Rounds = math.max((gun.Rounds or 1) - 1, 0)
+        gun.RechargeStartTime = workspace:GetServerTimeNow()
+        if target.player and target.dmg and target.dmg > 0 then
+            local key = calib.key(gun.Name, ZONE_MAP[target.part.Name], target.walls or 0)
+            calib.expect(target.player, key, target.dmg)
+        end
+    end
+    return ok
+end
+
+-- ===== Send hook (ФИКС РЕКУРСИИ) =====
+-- Логика: hookfunction может вернуть callable оригинала (Synapse) или мутировать
+-- ссылку in-place (некоторые executor'ы). В обоих случаях используем `hooked` для
+-- вызова оригинала. Если `hooked` = nil (executor не вернул) — fallback на sendRef.
+-- БЕЗ этого фикса — sendHook вызывает сам себя через мутированный sendRef → фриз.
+
+local sendRef = Remotes.Inventory.ShootWeapon.Send
+local hooked
+
+hooked = hookfunction(sendRef, function(packet, ...)
+    local function callOrig(...)
+        if type(hooked) == "function" then return hooked(...) end
+        return sendRef(...)
+    end
+
+    if getgenv().rage ~= cfg then return callOrig(packet, ...) end
+
+    if type(packet) == "table" and type(packet.Bullets) == "table" then
+        local b1 = packet.Bullets[1]
+        if type(b1) == "table" then
+            local isServer = (b1.Hits == nil)
+            if isServer ~= server.hits then
+                server.setHits(isServer)
+                print("[rage] server_hits=" .. tostring(isServer) .. " (from packet)")
+            end
+        end
+
+        if packet.__cf_rage then
+            packet.__cf_rage = nil
+            return callOrig(packet, ...)
+        end
+    end
+
+    return callOrig(packet, ...)
+end)
+
+print("[rage] Send hooked: " .. type(hooked))
+
+-- ===== Heartbeat loop =====
+local heartbeat = RunService.Heartbeat:Connect(function(dt)
+    if not getgenv().rage or not cfg.enabled then return end
+
+    trackVelocity(dt)
+    trackBacktrack()
+
+    local gun = getSlot()
+    if not gun or not gun.Bullet or not gun.Properties or gun.IsReloading then return end
+    if (gun.Rounds or 0) <= 0 then return end
+
+    local results = scan(gun)
+    if #results == 0 or not cfg.auto_fire then return end
+
+    local now = os.clock()
+    if now - lastFire < fireRate(gun) then return end
+
+    local target = results[1]
+    local taps = 1
+    if cfg.tap_kill and target.dmg > 0 then
+        taps = math.clamp(math.ceil(target.hp / target.dmg), 1, cfg.max_taps)
+    end
+    if cfg.double_tap and taps < 2 then taps = 2 end
+
+    for _ = 1, taps do
+        if (gun.Rounds or 0) <= 0 then break end
+        if not fire(gun, target) then break end
+    end
+
+    lastFire = now
+end)
+
+-- ===== unload =====
+getgenv().rage.stats = function()
+    return { targets = #scanCache, server = server.hits, gun = getSlot() ~= nil }
+end
+
+getgenv().rage.unload = function()
+    if heartbeat then pcall(function() heartbeat:Disconnect() end) end
+    if restorefunction and type(hooked) == "function" then
+        pcall(restorefunction, hooked)
+    end
+    getgenv().rage = nil
+    print("[rage] unloaded")
+end
+
+print("[rage] ready 4/4 | srv=" .. tostring(server.hits))
+print("[rage] unload: getgenv().rage.unload()")
